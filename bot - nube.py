@@ -1,1105 +1,383 @@
 import os
-import re
 import io
-import asyncio
-import logging
-from pathlib import Path
-import tempfile
+import re
+import csv
+import json
 import time
+import logging
+import asyncio
 from datetime import datetime
-import pandas as pd
+from typing import Optional, Tuple, List, Dict
 
-from telegram import Update, InputMediaPhoto
-from telegram.constants import ParseMode
+from telegram import Update, InputFile, InputMediaPhoto
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
-from telegram.request import HTTPXRequest
-from telegram.error import NetworkError, TimedOut, RetryAfter
 
-# =====================
-# CONFIG
-# =====================
-TOKEN = "7566059380:AAHU6w0i3oc2CkMtmabbTQpG7OuR23DZB28"
-IMAGENES_FOLDER = r"E:\\Telgram bot\\Imagenes cartones 1"
-CSV_FILE = "registro.csv"
-USUARIOS_FILE = "usuarios.csv"
-LOTES_FILE = "lotes.csv"
-RANGO_FILE = "rango.txt"
-DEVOLUCIONES_FILE = "devoluciones.csv"
-ADMIN_ID = 1644932856
+# -------- Google Drive (Service Account)
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("bot")
+# =========================
+# Config & Logging
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+log = logging.getLogger("bot")
 
-# Append-only logs (crash safety)
-VENTAS_LOG = "ventas.log"
-DEVOL_LOG = "devoluciones.log"
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # Token de BotFather
+DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]  # ID carpeta Drive con imágenes + CSV
+GSA_JSON = os.environ["GSA_JSON"]  # Contenido JSON (texto) de la Service Account
 
-# Users waiting to send their username
-usuarios_pendientes: set[int] = set()
+# Webhook/public URL (Render expone RENDER_EXTERNAL_URL). Puedes definir PUBLIC_URL manualmente si quieres.
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
 
-# Kicked users (until next restart)
-kicked_users: set[int] = set()
+# Nombres de CSV en Drive (puedes cambiarlos por ENV si ya usas otros nombres)
+USERS_CSV = os.environ.get("USERS_CSV", "users.csv")
+LOTES_CSV = os.environ.get("LOTES_CSV", "lotes.csv")
+VENTAS_CSV = os.environ.get("VENTAS_CSV", "ventas.csv")
 
-# =====================
-# ATOMIC CSV + LOG HELPERS (Windows-safe)
-# =====================
-def atomic_write_csv(df: pd.DataFrame, path: str, retries: int = 6, base_sleep: float = 0.25):
-    """Write CSV atomically in the same directory. Retries on PermissionError (Excel/AV)."""
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    base = os.path.basename(path)
-    last_exc = None
-    for attempt in range(retries):
-        fd, tmp = tempfile.mkstemp(prefix=f"~{base}.", suffix=".tmp", dir=directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                df.to_csv(f, index=False)
-                f.flush()
-                os.fsync(f.fileno())
-            try:
-                os.replace(tmp, path)  # atomic on same filesystem
-                return
-            except PermissionError as e:
-                last_exc = e
-                time.sleep(base_sleep * (attempt + 1))
-        finally:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-    if last_exc:
-        raise PermissionError(f"No se pudo escribir {path}. ¿Está abierto en Excel?") from last_exc
+# Cabeceras por defecto (ajústalas si ya usas otras columnas)
+USERS_HEADERS = ["usuario_id", "nombre_usuario", "nombre_completo"]
+LOTES_HEADERS = ["nombre_usuario", "carton"]
+VENTAS_HEADERS = ["timestamp", "usuario_id", "nombre_usuario", "imagen"]
 
-def append_log_line(path: str, line: str, retries: int = 5, base_sleep: float = 0.15):
-    """Append a single line and fsync, with retries for Windows."""
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            with open(path, "a", encoding="utf-8", newline="") as f:
-                f.write(line + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            return
-        except PermissionError as e:
-            last_exc = e
-            time.sleep(base_sleep * (attempt + 1))
-    if last_exc:
-        raise last_exc
+# Concurrency locks para escrituras CSV
+CSV_LOCK = asyncio.Lock()
 
-def canon(s: str) -> str:
-    return (s or "").strip().casefold()
+# =========================
+# Utilidades Google Drive
+# =========================
+def drive_client():
+    info = json.loads(GSA_JSON)
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-# =====================
-# DATA STORE (in-memory cache with locks)
-# =====================
-class Store:
-    def __init__(self):
-        self.users_df = pd.DataFrame(columns=["usuario_id", "nombre_usuario", "nombre_completo"])
-        self.reg_df = pd.DataFrame(columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por"])
-        self.lotes_df = pd.DataFrame(columns=["nombre_usuario", "carton"])
-        self.devs_df = pd.DataFrame(columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por", "fecha"])
+def drive_find_file(service, name_exact: str) -> Optional[Dict]:
+    """Busca archivo por nombre exacto en la carpeta (no basura)."""
+    q = (
+        f"'{DRIVE_FOLDER_ID}' in parents and name = '{name_exact.replace(\"'\", \"\\'\")}' "
+        "and trashed = false"
+    )
+    res = service.files().list(q=q, fields="files(id,name,mimeType)").execute()
+    files = res.get("files", [])
+    return files[0] if files else None
 
-        self.users_lock = asyncio.Lock()
-        self.reg_lock = asyncio.Lock()
-        self.lotes_lock = asyncio.Lock()
-        self.devs_lock = asyncio.Lock()
+def drive_search_contains(service, substr: str, mime_contains: Optional[str] = None) -> Optional[Dict]:
+    """Busca el primer archivo cuyo nombre contenga substr (case-insensitive)."""
+    q = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
+    if mime_contains:
+        q += f" and mimeType contains '{mime_contains}'"
+    page_token = None
+    low = substr.lower()
+    while True:
+        resp = service.files().list(
+            q=q,
+            fields="nextPageToken,files(id,name,mimeType)",
+            pageToken=page_token
+        ).execute()
+        for f in resp.get("files", []):
+            if low in f["name"].lower():
+                return f
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return None
 
-    def load_all_sync(self):
-        if os.path.exists(USUARIOS_FILE):
-            self.users_df = pd.read_csv(USUARIOS_FILE)
-        if os.path.exists(CSV_FILE):
-            self.reg_df = pd.read_csv(CSV_FILE)
-            if "devuelto_por" not in self.reg_df.columns:
-                self.reg_df["devuelto_por"] = ""
-        if os.path.exists(LOTES_FILE):
-            self.lotes_df = pd.read_csv(LOTES_FILE)
-        if os.path.exists(DEVOLUCIONES_FILE):
-            self.devs_df = pd.read_csv(DEVOLUCIONES_FILE)
+def drive_download_bytes(service, file_id: str) -> bytes:
+    req = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    buf.seek(0)
+    return buf.read()
 
-    async def save_users(self):
-        async with self.users_lock:
-            df = self.users_df.copy()
-        await asyncio.to_thread(atomic_write_csv, df, USUARIOS_FILE)
+def drive_upload_bytes(service, name: str, data: bytes, mime_type: str = "text/csv") -> str:
+    """
+    Crea o actualiza archivo por nombre exacto dentro de la carpeta.
+    Retorna file_id.
+    """
+    meta = drive_find_file(service, name)
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
+    if meta:
+        file_id = meta["id"]
+        updated = service.files().update(fileId=file_id, media_body=media).execute()
+        return updated["id"]
+    else:
+        file_metadata = {"name": name, "parents": [DRIVE_FOLDER_ID]}
+        created = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        return created["id"]
 
-    async def save_reg(self):
-        async with self.reg_lock:
-            df = self.reg_df.copy()
-        await asyncio.to_thread(atomic_write_csv, df, CSV_FILE)
+# =========================
+# CSV en Drive (lectura/escritura)
+# =========================
+async def ensure_csv_exists(name: str, headers: List[str]) -> str:
+    """Garantiza que el CSV exista en Drive con las cabeceras. Retorna file_id."""
+    service = drive_client()
+    meta = drive_find_file(service, name)
+    if meta:
+        return meta["id"]
+    # Crear CSV vacío con cabeceras
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(headers)
+    file_id = drive_upload_bytes(service, name, buf.getvalue().encode("utf-8"))
+    return file_id
 
-    async def save_lotes(self):
-        async with self.lotes_lock:
-            df = self.lotes_df.copy()
-        await asyncio.to_thread(atomic_write_csv, df, LOTES_FILE)
+async def csv_read_all(name: str, headers: List[str]) -> List[Dict[str, str]]:
+    """Lee todo el CSV desde Drive y retorna lista de dicts."""
+    service = drive_client()
+    meta = drive_find_file(service, name)
+    if not meta:
+        await ensure_csv_exists(name, headers)
+        meta = drive_find_file(service, name)
+        if not meta:
+            return []
+    data = drive_download_bytes(service, meta["id"]).decode("utf-8", errors="replace")
+    rows: List[Dict[str, str]] = []
+    reader = csv.DictReader(io.StringIO(data))
+    for r in reader:
+        rows.append({k: (r.get(k, "") or "") for k in reader.fieldnames})
+    return rows
 
-    async def save_devs(self):
-        async with self.devs_lock:
-            df = self.devs_df.copy()
-        await asyncio.to_thread(atomic_write_csv, df, DEVOLUCIONES_FILE)
+async def csv_write_all(name: str, headers: List[str], rows: List[Dict[str, str]]) -> None:
+    """Sobrescribe completo el CSV en Drive con filas dadas (dicts)."""
+    service = drive_client()
+    await ensure_csv_exists(name, headers)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, lineterminator="\n")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({h: r.get(h, "") for h in headers})
+    drive_upload_bytes(service, name, buf.getvalue().encode("utf-8"))
 
-store = Store()
+async def csv_append_row(name: str, headers: List[str], row: Dict[str, str]) -> None:
+    """Agrega una fila al CSV en Drive (descarga + agrega + sube)."""
+    async with CSV_LOCK:
+        rows = await csv_read_all(name, headers)
+        rows.append({h: row.get(h, "") for h in headers})
+        await csv_write_all(name, headers, rows)
 
-# =====================
-# RANGE (cache)
-# =====================
-RANGO: tuple[int, int] | None = None
+# =========================
+# Imágenes desde Drive
+# =========================
+IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 
-def load_rango_from_disk_sync():
-    global RANGO
-    p = Path(RANGO_FILE)
-    if not p.exists():
-        RANGO = None
-        return
-    try:
-        ini, fin = map(int, p.read_text(encoding="utf-8").strip().split(","))
-        RANGO = (ini, fin)
-    except Exception as e:
-        logger.error(f"Error leyendo rango: {e}")
-        RANGO = None
+def normalize_query_to_candidates(text: str) -> List[str]:
+    """Convierte '1750' en ['1750', '1750.jpg', ...]."""
+    text = text.strip()
+    cands = [text]
+    lower = text.lower()
+    if not any(lower.endswith(ext) for ext in IMAGE_EXTS):
+        for ext in IMAGE_EXTS:
+            cands.append(text + ext)
+    return cands
 
-# =====================
-# STARTUP RECONCILIATION (recover from crash using logs)
-# =====================
-def parse_log_line(line: str):
-    # tipo;user_id;nombre;imagen;timestamp;extra?
-    parts = [p.strip() for p in line.strip().split(";")]
-    if len(parts) < 5:
+def drive_find_image(service, query_text: str) -> Optional[Dict]:
+    """
+    Busca imagen por nombre exacto (con variantes) y si no, por 'contains'.
+    Retorna {id,name,mimeType} o None.
+    """
+    # Intentos exactos
+    for cand in normalize_query_to_candidates(query_text):
+        meta = drive_find_file(service, cand)
+        if meta and meta.get("mimeType", "").startswith("image/"):
+            return meta
+    # Fallback: contains
+    return drive_search_contains(service, query_text, mime_contains="image/")
+
+async def get_image_inputfile(query_text: str) -> Optional[Tuple[InputFile, str]]:
+    """Devuelve (InputFile, filename) o None si no encuentra."""
+    service = drive_client()
+    meta = drive_find_image(service, query_text)
+    if not meta:
         return None
-    tipo, uid_s, nombre, imagen_s, ts = parts[:5]
-    if tipo not in ("venta", "devol"):
-        return None
-    try:
-        uid = int(uid_s)
-        imagen = int(imagen_s)
-    except:
-        return None
-    extra = parts[5] if len(parts) > 5 else ""
-    return {"tipo": tipo, "usuario_id": uid, "nombre_usuario": nombre, "imagen": imagen, "ts": ts, "extra": extra}
+    data = drive_download_bytes(service, meta["id"])
+    bio = io.BytesIO(data)
+    bio.name = meta["name"]
+    return InputFile(bio), meta["name"]
 
-def reconcile_from_logs_sync():
-    """Recover missing rows from ventas/devol logs into CSVs (idempotent)."""
-    ventas = []
-    if os.path.exists(VENTAS_LOG):
-        with open(VENTAS_LOG, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                v = parse_log_line(line)
-                if v and v["tipo"] == "venta":
-                    ventas.append(v)
-    devols = []
-    if os.path.exists(DEVOL_LOG):
-        with open(DEVOL_LOG, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                d = parse_log_line(line)
-                if d and d["tipo"] == "devol":
-                    devols.append(d)
+# =========================
+# Helpers del bot
+# =========================
+RANGE_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
 
-    # Merge ventas to reg_df
-    if ventas:
-        df = store.reg_df.copy()
-        existing = set((int(r["usuario_id"]), str(r["nombre_usuario"]), int(r["imagen"])) for r in df.to_dict("records"))
-        new_rows = []
-        for v in ventas:
-            key = (v["usuario_id"], v["nombre_usuario"], v["imagen"])
-            if key not in existing:
-                new_rows.append([v["usuario_id"], v["nombre_usuario"], v["imagen"], ""])
-                existing.add(key)
-        if new_rows:
-            df = pd.concat([df, pd.DataFrame(new_rows, columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por"])], ignore_index=True)
-            store.reg_df = df
-            try:
-                atomic_write_csv(df, CSV_FILE)
-            except Exception as e:
-                logger.warning(f"No se pudo guardar registro.csv en reconciliación: {e}")
-
-    # Apply devoluciones: remove from reg and log to devs
-    if devols:
-        df = store.reg_df.copy()
-        to_remove_mask = pd.Series(False, index=df.index)
-        dev_rows = []
-        for d in devols:
-            mask = (
-                (df["usuario_id"].astype(int) == d["usuario_id"]) &
-                (df["nombre_usuario"].astype(str) == d["nombre_usuario"]) &
-                (df["imagen"].astype(int) == d["imagen"])
-            )
-            if mask.any():
-                to_remove_mask = to_remove_mask | mask
-                dev_rows.append([d["usuario_id"], d["nombre_usuario"], d["imagen"], d.get("extra", ""), d["ts"]])
-        if to_remove_mask.any():
-            df2 = df[~to_remove_mask]
-            store.reg_df = df2
-            try:
-                atomic_write_csv(df2, CSV_FILE)
-            except Exception as e:
-                logger.warning(f"No se pudo guardar registro.csv (post-devol): {e}")
-        if dev_rows:
-            dev_df = store.devs_df.copy()
-            dev_df = pd.concat([dev_df, pd.DataFrame(dev_rows, columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por", "fecha"])], ignore_index=True)
-            store.devs_df = dev_df
-            try:
-                atomic_write_csv(dev_df, DEVOLUCIONES_FILE)
-            except Exception as e:
-                logger.warning(f"No se pudo guardar devoluciones.csv: {e}")
-
-# =====================
-# HELPERS
-# =====================
-def agrupar_en_rangos(numeros: list[int]) -> list[str]:
-    if not numeros:
-        return []
-    numeros = sorted(numeros)
-    rangos = []
-    start = prev = numeros[0]
-    for n in numeros[1:]:
-        if n == prev + 1:
-            prev = n
-        else:
-            rangos.append(str(start) if start == prev else f"{start}-{prev}")
-            start = prev = n
-    rangos.append(str(start) if start == prev else f"{start}-{prev}")
-    return rangos
-
-def parse_numeros(tokens: list[str]) -> set[int] | None:
-    numeros: set[int] = set()
-    for t in tokens:
-        if re.match(r"^\d+-\d+$", t):
-            a, b = map(int, t.split("-"))
+def parse_numbers(text: str) -> List[str]:
+    """
+    Acepta entradas como:
+      - "1750"
+      - "1 3,5-8 10-12"
+    Retorna lista expandida de strings (números) SIN duplicados, ordenados.
+    """
+    parts = re.split(r"[,\s]+", text.strip())
+    nums: set[int] = set()
+    for p in parts:
+        if not p:
+            continue
+        m = RANGE_RE.match(p)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
             if a <= b:
-                numeros.update(range(a, b + 1))
-        elif t.isdigit():
-            numeros.add(int(t))
+                for n in range(a, b + 1):
+                    nums.add(n)
+            else:
+                for n in range(b, a + 1):
+                    nums.add(n)
+        elif p.isdigit():
+            nums.add(int(p))
         else:
-            return None
-    return numeros
+            # si el usuario pone '1750.jpg' lo tratamos como número base '1750'
+            base = re.sub(r"\D", "", p)
+            if base.isdigit():
+                nums.add(int(base))
+    return [str(n) for n in sorted(nums)]
 
-def is_kicked(uid: int) -> bool:
-    return uid in kicked_users
+async def ensure_csvs_ready():
+    await ensure_csv_exists(USERS_CSV, USERS_HEADERS)
+    await ensure_csv_exists(LOTES_CSV, LOTES_HEADERS)
+    await ensure_csv_exists(VENTAS_CSV, VENTAS_HEADERS)
 
-# Network retries
-async def reply_text_retry(message, text, **kwargs):
-    for delay in (0, 0.5, 1):
-        try:
-            return await message.reply_text(text, **kwargs)
-        except (NetworkError, TimedOut):
-            await asyncio.sleep(delay)
-    return await message.reply_text(text, **kwargs)
-
-async def send_media_group_retry(bot, chat_id, media, **kwargs):
-    for delay in (0, 0.5, 1):
-        try:
-            return await bot.send_media_group(chat_id=chat_id, media=media, **kwargs)
-        except (NetworkError, TimedOut):
-            await asyncio.sleep(delay)
-    return await bot.send_media_group(chat_id=chat_id, media=media, **kwargs)
-
-# Global error handler
-async def error_handler(update, context):
-    try:
-        raise context.error
-    except RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-    except (NetworkError, TimedOut) as e:
-        logger.warning(f"Error de red: {e}")
-        await asyncio.sleep(0.5)
-    except Exception:
-        logger.exception("Excepción no controlada")
-
-# =====================
-# COMMANDS (ADMIN + ALL) – single definitions to avoid duplicates
-# =====================
-async def info_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await reply_text_retry(update.message, "⛔ Comando solo para el administrador.")
-        return
-    texto = (
-        "<b>🛠️ Comandos del bot</b>\n\n"
-        "<b>👥 Usuarios</b>\n"
-        "• Envía números o rangos (ej. <code>1 3 5-8</code>) para pedir cartones.\n"
-        "• <code>/help</code> — Ayuda.\n"
-        "• <code>/v</code> — Tus vendidos (o global si eres admin).\n"
-        "• <code>/r &lt;números/rangos&gt;</code> — Devolver cartones propios.\n"
-        "• <code>/disp</code> — Ver <u>tus</u> cartones disponibles.\n\n"
-        "<b>👑 Admin</b>\n"
-        "• <code>/rango &lt;ini&gt; &lt;fin&gt;</code>, <code>/lista</code>, <code>/usuarios</code>, <code>/kick &lt;usuario&gt;</code>\n"
-        "• <code>/vendido &lt;usuario&gt; &lt;nums/rangos&gt;</code>, <code>/c</code>\n"
-        "• <code>/lote</code>, <code>/ver_lote</code>, <code>/quitar_lote</code>\n"
-        "• <code>/reset</code>, <code>/id</code>\n"
+# =========================
+# Handlers
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_csvs_ready()
+    await update.message.reply_text(
+        "Hola 👋\n"
+        "Envíame un número o rango (ej. `1750` o `1 3 5-8`) y te envío los cartones desde Drive.\n"
+        "También puedes usar /img 1750.",
+        parse_mode="Markdown"
     )
-    await reply_text_retry(update.message, texto, parse_mode=ParseMode.HTML)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_kicked(update.effective_user.id):
-        await reply_text_retry(update.message, "⛔ Has sido bloqueado temporalmente por el administrador.")
+async def img(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_csvs_ready()
+    if not context.args:
+        await update.message.reply_text("Uso: /img <número|nombre|id>\nEj: /img 1750")
         return
-    is_admin = update.effective_user.id == ADMIN_ID
-    texto = (
-        "<b>ℹ️ Ayuda</b>\n\n"
-        "<b>Para todos</b>\n"
-        "• Envía números o rangos para pedir cartones (ej: <code>1 3 5-8</code>).\n"
-        "• <code>/v</code> — Ver tus vendidos.\n"
-        "• <code>/r &lt;números/rangos&gt;</code> — Devolver cartones propios.\n"
-        "• <code>/disp</code> — Ver <u>tus</u> cartones disponibles.\n"
-    )
-    if is_admin:
-        texto += (
-            "\n<b>Admin</b>\n"
-            "• <code>/rango</code>, <code>/lista</code>, <code>/usuarios</code>, <code>/kick</code>\n"
-            "• <code>/vendido</code>, <code>/c</code>, <code>/lote</code>, <code>/ver_lote</code>, <code>/quitar_lote</code>\n"
-            "• <code>/reset</code>, <code>/id</code>, <code>/info</code>\n"
-        )
-    await reply_text_retry(update.message, texto, parse_mode=ParseMode.HTML)
 
-async def usuarios_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    query = " ".join(context.args).strip()
+    res = await get_image_inputfile(query)
+    if not res:
+        await update.message.reply_text("No encontré esa imagen en la carpeta de Drive.")
         return
-    async with store.users_lock:
-        df = store.users_df.copy()
-    if df.empty:
-        await reply_text_retry(update.message, "📇 No hay usuarios registrados.")
-        return
-    df = df.astype({"usuario_id": "int64"})
-    df = df.sort_values("nombre_usuario", key=lambda s: s.str.lower())
-    lineas = [f"👤 {row['nombre_usuario']} — ID: {row['usuario_id']}" for _, row in df.iterrows()]
-    await reply_text_retry(update.message, "🧑‍💻 <b>Usuarios registrados</b>\n" + "\n".join(lineas), parse_mode=ParseMode.HTML)
 
-async def kick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) != 1:
-        await reply_text_retry(update.message, "Uso: /kick <nombre_usuario>")
-        return
-    target = canon(context.args[0])
-    async with store.users_lock:
-        df = store.users_df.copy()
-        mask = df["nombre_usuario"].astype(str).str.casefold() == target
-        matches = df[mask]
-        if matches.empty:
-            await reply_text_retry(update.message, f"No encontré al usuario '{context.args[0]}'.")
-            return
-        ids = set(matches["usuario_id"].astype(int).tolist())
-        for uid in ids:
-            kicked_users.add(uid)
-        store.users_df = df[~mask]
-    await store.save_users()
-    listado = ", ".join(f"{u}({i})" for u, i in zip(matches["nombre_usuario"], matches["usuario_id"]))
-    await reply_text_retry(update.message, f"⛔ Usuario(s) bloqueado(s) hasta reinicio: {listado}")
+    input_file, fname = res
+    msg = await update.message.reply_photo(photo=input_file, caption=fname)
 
-async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    async with store.reg_lock:
-        df = store.reg_df.copy()
-    if df.empty:
-        ventas_txt = "📄 No se ha vendido ningún cartón."
-    else:
-        lineas = []
-        grp = df.groupby("nombre_usuario")["imagen"].apply(lambda s: sorted(map(int, s.tolist()))).reset_index()
-        for _, row in grp.iterrows():
-            nums = row["imagen"]
-            lineas.append(f"👤 {row['nombre_usuario']} (total {len(nums)}): " + ", ".join(map(str, nums)))
-        ventas_txt = "\n".join(lineas)
+    # Log a ventas.csv
+    user = update.effective_user
+    row = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "usuario_id": str(user.id),
+        "nombre_usuario": user.username or user.full_name or "",
+        "imagen": fname,
+    }
+    await csv_append_row(VENTAS_CSV, VENTAS_HEADERS, row)
 
-    async with store.devs_lock:
-        devs = store.devs_df.copy()
-    if devs.empty:
-        devs_txt = "—"
-    else:
-        dlines = []
-        dgrp = devs.groupby("nombre_usuario")["imagen"].apply(lambda s: sorted(map(int, s.tolist()))).reset_index()
-        for _, row in dgrp.iterrows():
-            dlines.append(f"♻️ {row['nombre_usuario']}: " + ", ".join(map(str, row["imagen"])))
-        devs_txt = "\n".join(dlines)
-
-    mensaje = "🧾 <b>Ventas actuales</b>\n" + ventas_txt + "\n\n" + "♻️ <b>Devoluciones</b>\n" + devs_txt
-    await reply_text_retry(update.message, mensaje, parse_mode=ParseMode.HTML)
-
-async def definir_rango(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) != 2:
-        await reply_text_retry(update.message, "Uso correcto: /rango <inicio> <fin>")
-        return
-    try:
-        inicio = int(context.args[0]); fin = int(context.args[1])
-    except ValueError:
-        await reply_text_retry(update.message, "⚠️ Debes enviar dos números enteros válidos.")
-        return
-    if inicio > fin:
-        await reply_text_retry(update.message, "⚠️ El número de inicio debe ser menor o igual que el de fin.")
-        return
-    global RANGO
-    RANGO = (inicio, fin)
-    try:
-        Path(RANGO_FILE).write_text(f"{inicio},{fin}", encoding="utf-8")
-    except Exception as e:
-        await reply_text_retry(update.message, f"⚠️ Error guardando rango: {e}")
-        return
-    await reply_text_retry(update.message, f"✅ Rango definido: desde {inicio} hasta {fin}.")
-
-async def enviar_directo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    numeros = parse_numeros(context.args)
-    if numeros is None or not numeros:
-        await reply_text_retry(update.message, "Uso: /c <número(s)> o rangos (ej: 1 2 5-10)")
-        return
-    await reply_text_retry(update.message, f"📨 Enviando cartones: {', '.join(map(str, sorted(numeros)))}\n⏳ Espere...")
-    for n in sorted(numeros):
-        ruta = os.path.join(IMAGENES_FOLDER, f"{n}.jpg")
-        if os.path.exists(ruta):
-            with open(ruta, "rb") as f:
-                # send one by one (doesn't register sale)
-                try:
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f)
-                except Exception:
-                    pass
-        else:
-            await reply_text_retry(update.message, f"❌ No se encontró el cartón N° {n}.")
-
-async def ver_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) != 1:
-        await reply_text_retry(update.message, "Uso: /ver_lote <nombre_usuario>")
-        return
-    target_canon = canon(context.args[0])
-    async with store.lotes_lock:
-        dfl = store.lotes_df.copy()
-    mask = dfl["nombre_usuario"].astype(str).str.casefold() == target_canon
-    nums = sorted(dfl[mask]["carton"].astype(int).tolist())
-    display = context.args[0]
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_csvs_ready()
+    text = (update.message.text or "").strip()
+    nums = parse_numbers(text)
     if not nums:
-        await reply_text_retry(update.message, f"'{display}' no tiene cartones asignados.")
-        return
-    await reply_text_retry(update.message, f"Cartones asignados a '{display}': " + ", ".join(map(str, nums)))
-
-async def quitar_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) < 2:
-        await reply_text_retry(update.message, "Uso: /quitar_lote <nombre_usuario> <números/rangos>")
-        return
-    target_canon = canon(context.args[0])
-    nums = parse_numeros(context.args[1:])
-    if nums is None or not nums:
-        await reply_text_retry(update.message, "⚠️ No se detectaron números válidos para quitar.")
-        return
-    async with store.lotes_lock:
-        dfl = store.lotes_df.copy()
-        keep_mask = ~((dfl["nombre_usuario"].astype(str).str.casefold() == target_canon) & (dfl["carton"].astype(int).isin(nums)))
-        quitados = len(dfl) - int(keep_mask.sum())
-        store.lotes_df = dfl[keep_mask]
-    await store.save_lotes()
-    if quitados > 0:
-        await reply_text_retry(update.message, f"✅ Quitados {quitados} cartones del lote de '{context.args[0]}'.")
-    else:
-        await reply_text_retry(update.message, "ℹ️ No se encontró ninguno de esos cartones en el lote.")
-
-async def comando_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Assign numbers to a user (case-insensitive), skipping conflicts with others."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) < 2:
-        await reply_text_retry(update.message, "Uso: /lote <nombre_usuario> <números/rangos> (ej: /lote Diego 1-5 10 12)")
-        return
-    raw_name = context.args[0]
-    target_canon = canon(raw_name)
-    numeros = parse_numeros(context.args[1:])
-    if numeros is None or not numeros:
-        await reply_text_retry(update.message, "⚠️ No se detectaron números válidos para asignar.")
+        await update.message.reply_text("No detecté números válidos. Ejemplo: 1 3 5-8")
         return
 
-    async with store.lotes_lock:
-        dfl = store.lotes_df.copy()
-        owner_by_num = {int(r.carton): str(r.nombre_usuario) for r in dfl.itertuples(index=False)}
-        nuevos = []
-        ya_mios = []
-        conflictos = []
-        for n in sorted(numeros):
-            owner = owner_by_num.get(n)
-            if owner is None:
-                nuevos.append(n)
-            else:
-                if canon(owner) == target_canon:
-                    ya_mios.append(n)
-                else:
-                    conflictos.append((n, owner))
-        if nuevos:
-            add = pd.DataFrame([[raw_name, n] for n in nuevos], columns=["nombre_usuario", "carton"])
-            store.lotes_df = pd.concat([dfl, add], ignore_index=True)
-        else:
-            store.lotes_df = dfl
-    await store.save_lotes()
+    # Enviar en grupos de hasta 10 (Telegram limita los media groups)
+    sent_any = False
+    batch: List[InputMediaPhoto] = []
+    batch_names: List[str] = []
+    uploaded_files_to_close: List[io.BufferedReader] = []
 
-    partes = []
-    if nuevos:
-        partes.append(f"✅ Asignados a '{raw_name}': {', '.join(map(str, nuevos))}")
-    if ya_mios:
-        partes.append(f"ℹ️ Ya estaban asignados a ese usuario: {', '.join(map(str, ya_mios))}")
-    if conflictos:
-        partes.append("⛔ En conflicto (ya asignados a otra persona): " + ", ".join(f"{n}→{o}" for n, o in conflictos))
-        partes.append("Para reasignar, usa /quitar_lote al usuario actual y luego /lote al nuevo.")
-    if not partes:
-        partes.append("ℹ️ No hubo nada que asignar.")
-    await reply_text_retry(update.message, "\n".join(partes))
-
-    # Notify user if registered
-    async with store.users_lock:
-        dfu = store.users_df.copy()
-    mask = dfu["nombre_usuario"].astype(str).str.casefold() == target_canon
-    if nuevos and mask.any():
-        uid = int(dfu[mask].iloc[0]["usuario_id"])
-        try:
-            await context.bot.send_message(chat_id=uid, text=f"📦 Se te han asignado nuevos cartones: {', '.join(map(str, nuevos))}")
-        except Exception:
-            pass
-
-async def mostrar_vendidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: global totals. User: own totals."""
-    uid = update.effective_user.id
-    async with store.reg_lock:
-        df = store.reg_df.copy()
-    if df.empty or "imagen" not in df.columns:
-        await reply_text_retry(update.message, "📦 Aún no se ha vendido ningún cartón.")
-        return
-    if uid == ADMIN_ID:
-        vendidos = sorted(set(int(x) for x in df["imagen"].tolist()))
-        await reply_text_retry(update.message, f"🧾 Total vendidos (global): {len(vendidos)}\n🔢 Números: {', '.join(map(str, vendidos))}")
-        return
-    # user-specific
-    propios = sorted(set(int(x) for x in df[df["usuario_id"] == uid]["imagen"].tolist()))
-    if propios:
-        await reply_text_retry(update.message, f"🧾 Tus vendidos: {len(propios)}\n🔢 Números: {', '.join(map(str, propios))}")
-    else:
-        await reply_text_retry(update.message, "ℹ️ Aún no has vendido ningún cartón.")
-
-async def mostrar_disponibles(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show ONLY the current user's available numbers."""
-    global RANGO
-    if RANGO is None:
-        load_rango_from_disk_sync()
-    if RANGO is None:
-        await reply_text_retry(update.message, "❌ No hay rango definido aún. Usa /rango para definir uno.")
-        return
-    inicio, fin = RANGO
-
-    uid = update.effective_user.id
-    # Ensure registered
-    async with store.users_lock:
-        if uid not in set(store.users_df["usuario_id"].values):
-            await reply_text_retry(update.message, "Debes registrarte primero. Envía tu <b>nombre de usuario</b>.", parse_mode=ParseMode.HTML)
+    async def flush_batch():
+        nonlocal sent_any, batch, batch_names, uploaded_files_to_close
+        if not batch:
             return
-        nombre_usuario = store.users_df.loc[store.users_df["usuario_id"] == uid, "nombre_usuario"].values[0]
+        # Enviar como media group
+        for i in range(0, len(batch), 10):
+            chunk = batch[i:i+10]
+            await context.bot.send_media_group(chat_id=update.effective_chat.id, media=chunk)
+        # Log
+        user = update.effective_user
+        for fname in batch_names:
+            row = {
+                "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+                "usuario_id": str(user.id),
+                "nombre_usuario": user.username or user.full_name or "",
+                "imagen": fname,
+            }
+            await csv_append_row(VENTAS_CSV, VENTAS_HEADERS, row)
+        # Limpieza
+        for f in uploaded_files_to_close:
+            try: f.close()
+            except Exception: pass
+        batch, batch_names, uploaded_files_to_close = [], [], []
+        sent_any = True
 
-    async with store.reg_lock:
-        vendidos = set(map(int, store.reg_df["imagen"].tolist())) if "imagen" in store.reg_df.columns else set()
-    async with store.lotes_lock:
-        mis_asignados = set(map(int, store.lotes_df[store.lotes_df["nombre_usuario"].astype(str).str.casefold() == canon(nombre_usuario)]["carton"].tolist()))
-        asignados_por_num = {int(r.carton): r.nombre_usuario for r in store.lotes_df.itertuples(index=False)}
+    # Construir lote
+    for n in nums:
+        res = await get_image_inputfile(n)
+        if not res:
+            await update.message.reply_text(f"❌ No encontré '{n}' en Drive.")
+            continue
+        input_file, fname = res
+        media = InputMediaPhoto(media=input_file, caption=fname)
+        batch.append(media)
+        batch_names.append(fname)
+        # El InputFile ya usa BytesIO, no hace falta cerrar streams extra aquí
 
-    disponibles = []
-    if mis_asignados:
-        for n in sorted(mis_asignados):
-            if inicio <= n <= fin and n not in vendidos:
-                disponibles.append(n)
-    else:
-        for n in range(inicio, fin + 1):
-            if n in vendidos: 
-                continue
-            if n in asignados_por_num:
-                continue
-            disponibles.append(n)
+        if len(batch) == 10:
+            await flush_batch()
 
-    if not disponibles:
-        await reply_text_retry(update.message, "ℹ️ No tienes cartones disponibles para pedir ahora mismo.")
+    await flush_batch()
+    if not sent_any:
+        await update.message.reply_text("No se envió ninguna imagen.")
+
+# =========================
+# Arranque como Web Service (Webhook)
+# =========================
+async def on_startup(app: Application):
+    await ensure_csvs_ready()
+    if not PUBLIC_URL:
+        log.warning("PUBLIC_URL/RENDER_EXTERNAL_URL no definido; webhook no se registrará.")
         return
-    await reply_text_retry(update.message, "🎟️ <b>Tus</b> cartones disponibles:\n" + ", ".join(agrupar_en_rangos(disponibles)), parse_mode=ParseMode.HTML)
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+    webhook_url = f"{PUBLIC_URL}{webhook_path}"
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    await app.bot.set_webhook(url=webhook_url)
+    log.info(f"Webhook registrado en: {webhook_url}")
 
-async def remover_carton(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    numeros = parse_numeros(context.args)
-    if numeros is None or not numeros:
-        await reply_text_retry(update.message, "Uso: /r <número(s)/rangos> (ej: /r 2 4 6-9)")
-        return
-    uid = update.effective_user.id
-    user_name = update.effective_user.full_name
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    async with store.reg_lock:
-        df = store.reg_df
-        mask = (df["usuario_id"] == uid) & (df["imagen"].astype(int).isin(numeros))
-        cartones_usuario = df[mask]
-        if cartones_usuario.empty:
-            await reply_text_retry(update.message, "❌ No tienes ninguno de los cartones indicados para devolver.")
-            return
-        if "devuelto_por" not in df.columns:
-            df["devuelto_por"] = ""
-        # log lines first (crash safety)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for _, fila in cartones_usuario.iterrows():
-            append_log_line(DEVOL_LOG, f"devol;{int(fila['usuario_id'])};{fila['nombre_usuario']};{int(fila['imagen'])};{ts};{user_name}")
-        # apply removal
-        df.loc[mask, "devuelto_por"] = user_name
-        store.reg_df = df[~mask]
-        dev_rows = pd.DataFrame([
-            [int(fila["usuario_id"]), str(fila["nombre_usuario"]), int(fila["imagen"]), user_name, ts]
-            for _, fila in cartones_usuario.iterrows()
-        ], columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por", "fecha"])
-    async with store.devs_lock:
-        store.devs_df = pd.concat([store.devs_df, dev_rows], ignore_index=True)
-    await store.save_reg()
-    await store.save_devs()
+    # Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("img", img))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    cartones_devueltos = sorted(cartones_usuario["imagen"].astype(int).tolist())
-    await reply_text_retry(update.message, f"♻️ Cartones devueltos: {', '.join(map(str, cartones_devueltos))}")
+    # Startup hook
+    app.post_init = on_startup
 
-async def vendido_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /vendido <usuario> <nums/rangos> — register sales for that user with checks."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) < 2:
-        await reply_text_retry(update.message, "Uso: /vendido <nombre_usuario> <números/rangos>\nEj: /vendido diego 1-5 10 12")
-        return
-    target_input = context.args[0]
-    numeros = parse_numeros(context.args[1:])
-    if numeros is None or not numeros:
-        await reply_text_retry(update.message, "⚠️ No se detectaron números válidos para registrar.")
-        return
+    # Ejecutar servidor webhook (aiohttp interno de PTB)
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+    log.info(f"Iniciando servidor en 0.0.0.0:{PORT}{webhook_path}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=webhook_path,
+        # Importante: PUBLIC_URL usado en on_startup para set_webhook
+    )
 
-    # Find user by name (case-insensitive)
-    async with store.users_lock:
-        mask = store.users_df["nombre_usuario"].astype(str).str.casefold() == canon(target_input)
-        if not mask.any():
-            await reply_text_retry(update.message, f"⚠️ El usuario '{target_input}' no está registrado.")
-            return
-        row = store.users_df[mask].iloc[0]
-        target_uid = int(row["usuario_id"])
-        target_name = str(row["nombre_usuario"])
-
-    # Check assignments and sold
-    async with store.lotes_lock:
-        owner_by_num = {int(r.carton): str(r.nombre_usuario) for r in store.lotes_df.itertuples(index=False)}
-        my_lote = set(int(x) for x in store.lotes_df[store.lotes_df["nombre_usuario"].astype(str).str.casefold() == canon(target_name)]["carton"].tolist())
-    async with store.reg_lock:
-        sold_global = set(int(x) for x in store.reg_df["imagen"].tolist())
-
-    global RANGO
-    if RANGO is None:
-        load_rango_from_disk_sync()
-    check_range = RANGO is not None
-    if check_range:
-        inicio, fin = RANGO
-
-    permitidos, ya_vendidos, de_otro, fuera_lote, fuera_rango = [], [], [], [], []
-    tiene_lote = len(my_lote) > 0
-    for n in sorted(numeros):
-        if check_range and not (inicio <= n <= fin):
-            fuera_rango.append(n); continue
-        if n in sold_global:
-            ya_vendidos.append(n); continue
-        owner = owner_by_num.get(n)
-        if owner is not None and canon(owner) != canon(target_name):
-            de_otro.append((n, owner)); continue
-        if tiene_lote and (owner is None):
-            fuera_lote.append(n); continue
-        permitidos.append(n)
-
-    # Append ventas to log first (durable), then to CSV
-    if permitidos:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for n in permitidos:
-            append_log_line(VENTAS_LOG, f"venta;{target_uid};{target_name};{n};{ts}")
-        async with store.reg_lock:
-            nuevos = pd.DataFrame([[target_uid, target_name, n, ""] for n in permitidos], columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por"])
-            store.reg_df = pd.concat([store.reg_df, nuevos], ignore_index=True)
-        await store.save_reg()
-
-    partes = []
-    if permitidos:
-        partes.append("✅ Registrados como vendidos: " + ", ".join(map(str, permitidos)))
-    if ya_vendidos:
-        partes.append("ℹ️ Ya estaban vendidos: " + ", ".join(map(str, ya_vendidos)))
-    if de_otro:
-        partes.append("⛔ Asignados a otra persona: " + ", ".join(f"{n}→{d}" for n, d in de_otro))
-    if fuera_lote:
-        partes.append("⚠️ Fuera del lote del usuario: " + ", ".join(map(str, fuera_lote)))
-    if fuera_rango:
-        partes.append("⚠️ Fuera del rango definido: " + ", ".join(map(str, fuera_rango)))
-    if not partes:
-        partes.append("No se registró ningún número.")
-    await reply_text_retry(update.message, "\n".join(partes))
-
-async def reset_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # rotate files (ignore if missing)
-    def rotate(pth, prefix):
-        if os.path.exists(pth):
-            try:
-                os.replace(pth, f"{prefix}_{ts}.csv")
-            except Exception:
-                # fallback: copy content and truncate
-                try:
-                    with open(pth, "r", encoding="utf-8") as f:
-                        data = f.read()
-                    with open(f"{prefix}_{ts}.csv", "w", encoding="utf-8") as f2:
-                        f2.write(data)
-                except Exception:
-                    pass
-                try:
-                    open(pth, "w").close()
-                except Exception:
-                    pass
-
-    rotate(CSV_FILE, "Registro")
-    rotate(USUARIOS_FILE, "Usuarios")
-    rotate(LOTES_FILE, "Lotes")
-    rotate(DEVOLUCIONES_FILE, "Devoluciones")
-    # rotate logs too
-    if os.path.exists(VENTAS_LOG):
-        os.replace(VENTAS_LOG, f"ventas_{ts}.log")
-    if os.path.exists(DEVOL_LOG):
-        os.replace(DEVOL_LOG, f"devoluciones_{ts}.log")
-
-    async with store.users_lock, store.reg_lock, store.lotes_lock, store.devs_lock:
-        store.users_df = pd.DataFrame(columns=["usuario_id", "nombre_usuario", "nombre_completo"])
-        store.reg_df = pd.DataFrame(columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por"])
-        store.lotes_df = pd.DataFrame(columns=["nombre_usuario", "carton"])
-        store.devs_df = pd.DataFrame(columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por", "fecha"])
-
-    # persist empties atomically
-    await store.save_users()
-    await store.save_reg()
-    await store.save_lotes()
-    await store.save_devs()
-    await reply_text_retry(update.message, "🔄 Registro, usuarios, lotes y devoluciones reiniciados.")
-
-async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_text_retry(update.message, f"Tu ID: {update.effective_user.id}\nNombre: {update.effective_user.full_name}")
-
-# =====================
-# MESSAGE HANDLER (single; avoids duplicate replies)
-# =====================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_kicked(update.effective_user.id):
-        await reply_text_retry(update.message, "⛔ Has sido bloqueado temporalmente por el administrador.")
-        return
-
-    uid = update.effective_user.id
-    nombre_completo = update.effective_user.full_name
-    mensaje = (update.message.text or "").strip()
-
-    # Registration flow
-    async with store.users_lock:
-        dfu = store.users_df.copy()
-        registrados = set(dfu["usuario_id"].values)
-    if uid not in registrados:
-        if uid not in usuarios_pendientes:
-            usuarios_pendientes.add(uid)
-            await reply_text_retry(update.message, "Por favor, envía el <b>nombre de usuario</b> que quieres registrar.", parse_mode=ParseMode.HTML)
-            return
-        else:
-            nombre_usuario = mensaje.strip()
-            if not nombre_usuario:
-                await reply_text_retry(update.message, "El nombre de usuario no puede estar vacío. Envía un nombre válido.")
-                return
-            nombres_norm = set(dfu["nombre_usuario"].astype(str).str.casefold().tolist())
-            if canon(nombre_usuario) in nombres_norm:
-                await reply_text_retry(update.message, "⚠️ Ese nombre de usuario ya está en uso (no distingue mayúsculas). Elige otro.")
-                return
-            async with store.users_lock:
-                store.users_df = pd.concat([store.users_df, pd.DataFrame([[uid, nombre_usuario, nombre_completo]], columns=["usuario_id", "nombre_usuario", "nombre_completo"])], ignore_index=True)
-            await store.save_users()
-            usuarios_pendientes.discard(uid)
-
-            comandos_info = (
-                f"¡Hola {nombre_usuario}! Ya estás registrado.\n\n"
-                "📋 <b>Comandos</b>:\n"
-                "• Envía números o rangos para pedir cartones. Ej: <code>1 3 5-8</code>\n"
-                "• <code>/help</code> — Ver ayuda.\n"
-                "• <code>/v</code> — Ver tus cartones vendidos.\n"
-                "• <code>/r &lt;números/rangos&gt;</code> — Devolver cartones. Ej: <code>/r 2 4 6-9</code>\n"
-                "• <code>/disp</code> — Ver <u>tus</u> disponibles.\n"
-            )
-            await reply_text_retry(update.message, comandos_info, parse_mode=ParseMode.HTML)
-
-            # Inform assigned numbers (case-insensitive)
-            async with store.lotes_lock:
-                dfl = store.lotes_df.copy()
-            mask = dfl["nombre_usuario"].astype(str).str.casefold() == canon(nombre_usuario)
-            lotes_usuario = sorted(dfl[mask]["carton"].astype(int).tolist())
-            if lotes_usuario:
-                await reply_text_retry(update.message, f"Tienes asignados estos cartones (solo podrás pedir estos): {', '.join(map(str, lotes_usuario))}")
-            return
-
-    # Parse request numbers
-    numeros = parse_numeros(mensaje.split())
-    if numeros is None or not numeros:
-        await reply_text_retry(update.message, "⚠️ No se detectaron números válidos.")
-        return
-
-    # User's name and assignments
-    async with store.users_lock:
-        mi_nombre = store.users_df.loc[store.users_df["usuario_id"] == uid, "nombre_usuario"].values[0]
-    async with store.lotes_lock:
-        dfl = store.lotes_df.copy()
-    asignados_por_num = {int(r.carton): canon(str(r.nombre_usuario)) for r in dfl.itertuples(index=False)}
-    mis_asignados = set(int(r.carton) for r in dfl.itertuples(index=False) if canon(str(r.nombre_usuario)) == canon(mi_nombre))
-    tiene_lote = len(mis_asignados) > 0
-
-    permitidos: set[int] = set()
-    bloqueados_otro = []
-    fuera_de_mi_lote = []
-    for n in sorted(numeros):
-        duenio = asignados_por_num.get(n)
-        if duenio is not None:
-            if duenio == canon(mi_nombre):
-                permitidos.add(n)
-            else:
-                # find display owner
-                du_rows = dfl[dfl["carton"].astype(int) == n]["nombre_usuario"].astype(str).tolist()
-                bloqueados_otro.append((n, du_rows[0] if du_rows else "otro"))
-        else:
-            if tiene_lote:
-                fuera_de_mi_lote.append(n)
-            else:
-                permitidos.add(n)
-
-    if bloqueados_otro:
-        await reply_text_retry(update.message, "⛔ No puedes pedir cartones asignados a otra persona: " + ", ".join(f"{n}({d})" for n, d in bloqueados_otro))
-    if fuera_de_mi_lote:
-        await reply_text_retry(update.message, "⚠️ Estos cartones no están en tu lote: " + ", ".join(map(str, fuera_de_mi_lote)))
-    if not permitidos:
-        await reply_text_retry(update.message, "ℹ️ No hay cartones válidos para enviar según tus asignaciones.")
-        return
-
-    # Not sold yet
-    async with store.reg_lock:
-        enviados_usuario = set(int(x) for x in store.reg_df[store.reg_df["usuario_id"] == uid]["imagen"].tolist())
-        vendidos_global = set(int(x) for x in store.reg_df["imagen"].tolist())
-    a_enviar = [n for n in sorted(permitidos) if n not in enviados_usuario and n not in vendidos_global]
-    if not a_enviar:
-        await reply_text_retry(update.message, "✅ Ya se enviaron todos los cartones solicitados o no están disponibles.")
-        return
-
-    await reply_text_retry(update.message, f"📨 Enviando cartones N°: {', '.join(map(str, a_enviar))}\n⏳ Por favor, espere...")
-
-    # Build media group and register sales (log first)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    media_group, ok_nums, open_files = [], [], []
-    for n in a_enviar:
-        ruta = os.path.join(IMAGENES_FOLDER, f"{n}.jpg")
-        if os.path.exists(ruta):
-            f = open(ruta, "rb")
-            open_files.append(f)
-            media_group.append(InputMediaPhoto(media=f, filename=f"{n}.jpg"))
-            ok_nums.append(n)
-        else:
-            await reply_text_retry(update.message, f"❌ No se encontró el cartón N° {n}.")
-
-    if media_group:
-        # Persist intent in ventas.log first (so we can recover after crash)
-        for n in ok_nums:
-            append_log_line(VENTAS_LOG, f"venta;{uid};{mi_nombre};{n};{ts}")
-        try:
-            for i in range(0, len(media_group), 10):
-                await send_media_group_retry(context.bot, chat_id=update.effective_chat.id, media=media_group[i:i+10])
-        finally:
-            for f in open_files:
-                try: f.close()
-                except Exception: pass
-
-        # Save to CSV
-        async with store.reg_lock:
-            nuevos = pd.DataFrame([[uid, mi_nombre, n, ""] for n in ok_nums], columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por"])
-            store.reg_df = pd.concat([store.reg_df, nuevos], ignore_index=True)
-        await store.save_reg()
-# ========= /reload (solo admin) =========
-async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recarga desde los CSV a la memoria (usuarios, registro, lotes, devoluciones) y el rango."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    try:
-        users_df = pd.read_csv(USUARIOS_FILE) if os.path.exists(USUARIOS_FILE) else pd.DataFrame(
-            columns=["usuario_id", "nombre_usuario", "nombre_completo"]
-        )
-        reg_df = pd.read_csv(CSV_FILE) if os.path.exists(CSV_FILE) else pd.DataFrame(
-            columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por"]
-        )
-        if "devuelto_por" not in reg_df.columns:
-            reg_df["devuelto_por"] = ""
-
-        lotes_df = pd.read_csv(LOTES_FILE) if os.path.exists(LOTES_FILE) else pd.DataFrame(
-            columns=["nombre_usuario", "carton"]
-        )
-        devs_df = pd.read_csv(DEVOLUCIONES_FILE) if os.path.exists(DEVOLUCIONES_FILE) else pd.DataFrame(
-            columns=["usuario_id", "nombre_usuario", "imagen", "devuelto_por", "fecha"]
-        )
-
-        async with store.users_lock, store.reg_lock, store.lotes_lock, store.devs_lock:
-            store.users_df = users_df
-            store.reg_df = reg_df
-            store.lotes_df = lotes_df
-            store.devs_df = devs_df
-
-        load_rango_from_disk_sync()
-        reconcile_from_logs_sync()
-
-        await reply_text_retry(
-            update.message,
-            (
-                "🔄 Recarga completada.\n"
-                f"👥 usuarios={len(users_df)} | 🧾 vendidos={len(reg_df)} | 📦 lotes={len(lotes_df)} | ♻️ devoluciones={len(devs_df)}\n"
-                f"📐 rango={'sin definir' if RANGO is None else f'{RANGO[0]}–{RANGO[1]}'}"
-            )
-        )
-    except Exception as e:
-        await reply_text_retry(update.message, f"⚠️ Error al recargar: {e}")
-
-
-# ========= Avisos de inicio/detención =========
-async def _broadcast_to_all(app, text: str):
-    """Envía un mensaje a todos los usuarios registrados (ignora errores por usuario)."""
-    async with store.users_lock:
-        ids = [int(x) for x in store.users_df["usuario_id"].tolist()]
-    # Throttle suave para no gatillar flood control
-    for uid in ids:
-        try:
-            await app.bot.send_message(chat_id=uid, text=text)
-            await asyncio.sleep(0.05)
-        except Exception:
-            # Usuario bloqueó el bot o no tiene chat abierto; ignorar
-            pass
-
-async def _on_startup(app):
-    # Aviso de que el bot está encendido
-    try:
-        await _broadcast_to_all(app, "✅ El bot está encendido nuevamente.")
-    except Exception:
-        pass
-
-async def _on_shutdown(app):
-    # Aviso de que el bot se detuvo
-    try:
-        await _broadcast_to_all(app, "⚠️ El bot se ha detenido. Volverá pronto.")
-    except Exception:
-        pass
-# ========= PARCHE: /off (aviso y apagado en 2 minutos) =========
-OFF_TASK = None
-OFF_DEADLINE = None
-
-async def _broadcast_to_all__off(app, text: str):
-    """Envía un mensaje a todos los usuarios registrados (+ admin). Ignora errores individuales."""
-    try:
-        async with store.users_lock:
-            ids = [int(x) for x in store.users_df["usuario_id"].tolist()]
-    except Exception:
-        ids = []
-    if ADMIN_ID not in ids:
-        ids.append(ADMIN_ID)
-    for uid in ids:
-        try:
-            await app.bot.send_message(chat_id=uid, text=text)
-            await asyncio.sleep(0.05)  # leve throttle
-        except Exception:
-            pass  # usuario bloqueó el bot o no tiene chat; ignorar
-
-async def _shutdown_after_delay__off(app):
-    """Espera 120s, avisa y detiene la aplicación."""
-    global OFF_TASK, OFF_DEADLINE
-    try:
-        await asyncio.sleep(120)
-        # Aviso final de apagado (si ya tienes un post_shutdown que avisa, puedes comentar la línea de abajo)
-        await _broadcast_to_all__off(app, "⏹️ El bot se está apagando ahora. Hasta pronto.")
-    finally:
-        OFF_TASK = None
-        OFF_DEADLINE = None
-        try:
-            app.stop()  # detiene el run_polling de forma limpia
-        except Exception:
-            pass
-
-async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/off — Solo admin: anuncia apagado en 2 minutos y luego detiene el bot."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    global OFF_TASK, OFF_DEADLINE
-
-    # Evitar programar múltiples apagados
-    if OFF_TASK and not OFF_TASK.done():
-        try:
-            loop = asyncio.get_running_loop()
-            secs = int(max(0, OFF_DEADLINE - loop.time()))
-        except Exception:
-            secs = 120
-        await reply_text_retry(update.message, f"⏳ Apagado ya programado en ~{secs} s.")
-        return
-
-    await reply_text_retry(update.message, "⚠️ Se anunciará apagado y el bot se detendrá en 2 minutos.")
-    await _broadcast_to_all__off(context.application, "⚠️ Aviso: el bot se apagará en 2 minutos. y volvera a las 8 am")
-
-    loop = asyncio.get_running_loop()
-    OFF_DEADLINE = loop.time() + 120
-    OFF_TASK = asyncio.create_task(_shutdown_after_delay__off(context.application))
-
-# =====================
-# MAIN
-# =====================
 if __name__ == "__main__":
-    try:
-        # Load CSVs
-        store.load_all_sync()
-        load_rango_from_disk_sync()
-        # Reconcile from logs (in case of previous crash)
-        reconcile_from_logs_sync()
+    main()
 
-        # Telegram client with wider timeouts
-        request = HTTPXRequest(connect_timeout=15.0, read_timeout=45.0, write_timeout=45.0, pool_timeout=45.0)
-        app = ApplicationBuilder().token(TOKEN).request(request).concurrent_updates(True).build()
-
-        # Handlers (single set — avoids duplicates)
-        app.add_handler(CommandHandler("help", help_cmd))
-        app.add_handler(CommandHandler("info", info_admin))
-        app.add_handler(CommandHandler("usuarios", usuarios_cmd))
-        app.add_handler(CommandHandler("kick", kick_cmd))
-        app.add_handler(CommandHandler("id", whoami))
-        app.add_handler(CommandHandler("lista", lista))
-        app.add_handler(CommandHandler("v", mostrar_vendidos))
-        app.add_handler(CommandHandler("c", enviar_directo))
-        app.add_handler(CommandHandler("r", remover_carton))
-        app.add_handler(CommandHandler("reset", reset_registro))
-        app.add_handler(CommandHandler("lote", comando_lote))
-        app.add_handler(CommandHandler("ver_lote", ver_lote))
-        app.add_handler(CommandHandler("quitar_lote", quitar_lote))
-        app.add_handler(CommandHandler("vendido", vendido_cmd))
-        app.add_handler(CommandHandler("rango", definir_rango))
-        app.add_handler(CommandHandler("disp", mostrar_disponibles))
-        app.add_handler(CommandHandler("reload", reload_cmd))
-        app.add_handler(CommandHandler("off", off_cmd))  # <- nuevo comando solo admin
-        app.post_init = _on_startup
-        app.post_shutdown = _on_shutdown
-        
-
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-        app.add_error_handler(error_handler)
-
-        print("🤖 Bot iniciado...")
-        app.run_polling()
-    except Exception:
-        import traceback
-        print("\n💥 Ocurrió un error al iniciar el bot:\n")
-        traceback.print_exc()
-        input("\nPresiona Enter para cerrar...")
