@@ -632,7 +632,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch: List[InputMediaPhoto] = []
     names: List[str] = []
 
-        async def flush():
+    async def flush():
         nonlocal batch, names
         if not batch:
             return
