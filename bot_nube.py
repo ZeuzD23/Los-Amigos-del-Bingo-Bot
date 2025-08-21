@@ -71,7 +71,8 @@ def drive_client(readwrite: bool = True):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def drive_find_file(service, name_exact: str) -> Optional[Dict]:
-    q = f"'{DRIVE_FOLDER_ID}' in parents and name = '{name_exact.replace(\"'\", \"\\'\")}' and trashed = false"
+    name_sanitized = name_exact.replace("'", "\\'")
+    q = f"'{DRIVE_FOLDER_ID}' in parents and name = '{name_sanitized}' and trashed = false"
     r = service.files().list(q=q, fields="files(id,name,mimeType)").execute()
     files = r.get("files", [])
     return files[0] if files else None
