@@ -1,11 +1,9 @@
-import os, io, re, csv, json, asyncio, logging, time, uuid
-import mimetypes
-import uuid
-from datetime import datetime
+import os, io, re, csv, json, asyncio, logging, time, uuid, mimetypes
+from datetime import datetime, UTC
 from typing import Optional, Dict, List, Tuple
 
 import pandas as pd
-from telegram import Update, InputFile, InputMediaPhoto
+from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -26,20 +24,23 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
+# ENV obligatorias en Render
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GSA_JSON = os.environ["GSA_JSON"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
+# URL pública para webhook (Render la expone en RENDER_EXTERNAL_URL)
 PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
 PUBLIC_URL = PUBLIC_URL.rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# CSV en tu Drive
+# CSV en Drive
 USUARIOS_CSV = "usuarios.csv"
 LOTES_CSV = "lotes.csv"
 DEVOL_CSV = "devoluciones.csv"
 REGISTRO_CSV = "registro.csv"
+RANGO_TXT = "rango.txt"  # contenido: "ini-fin" (ej. "1-1000")
 
 # Cabeceras base
 USUARIOS_HEADERS = ["usuario_id", "nombre_usuario", "nombre_completo"]
@@ -47,18 +48,16 @@ LOTES_HEADERS    = ["nombre_usuario", "carton"]
 DEVOL_HEADERS    = ["timestamp", "usuario_id", "nombre_usuario", "imagen", "motivo"]
 REGISTRO_HEADERS = ["timestamp", "usuario_id", "nombre_usuario", "imagen"]
 
-# Rango global (texto)
-RANGO_TXT = "rango.txt"  # ej. "1-1000"
-
 # Concurrencia
 CSV_LOCK = asyncio.Lock()
 MEM_LOCK = asyncio.Lock()
 
-# En memoria
+# Estado en memoria
 usuarios_pendientes: set[int] = set()
 kicked_users: set[int] = set()
 maintenance_until_ts: float = 0.0  # /off: modo mantenimiento
 
+# Utilidades
 IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 RANGE_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
 
@@ -166,7 +165,7 @@ async def csv_append_row(name: str, headers: List[str], row: Dict[str, str]):
         await csv_write_all(name, headers, rows)
 
 # =========================
-# Rango global en Drive
+# Rango global (Drive)
 # =========================
 async def read_rango() -> Optional[Tuple[int,int]]:
     service = drive_client(False)
@@ -186,7 +185,7 @@ async def write_rango(a: int, b: int):
     drive_upload_bytes(service, RANGO_TXT, s.encode("utf-8"), mime_type="text/plain")
 
 # =========================
-# Imágenes desde Drive
+# Imágenes desde Drive (enviar SIEMPRE 1x1)
 # =========================
 def normalize_query_to_candidates(text: str) -> List[str]:
     text = (text or "").strip()
@@ -211,30 +210,25 @@ async def get_image_inputfile(query_text: str) -> Optional[Tuple[InputFile, str]
         return None
 
     data = drive_download_bytes(service, meta["id"])
-    bio = io.BytesIO(data)
-    bio.seek(0)
+    bio = io.BytesIO(data); bio.seek(0)
 
-    # Intenta conservar la extensión real
     base_name = meta.get("name") or f"{query_text}.jpg"
-    # Deducir extensión por mime o por nombre original
     mime = meta.get("mimeType", "")
     ext = None
     if mime and mime.startswith("image/"):
-        guess = mimetypes.guess_extension(mime)  # p.ej. ".jpg"
+        guess = mimetypes.guess_extension(mime)
         if guess:
             ext = guess
     if not ext:
-        # Usa la extensión del nombre original si es conocida
-        for e in [".jpg", ".jpeg", ".png", ".webp"]:
+        for e in IMAGE_EXTS:
             if base_name.lower().endswith(e):
                 ext = e
                 break
     if not ext:
         ext = ".jpg"
 
-    # Nombre de adjunto *limpio* y único (sin espacios/acentos)
+    # Nombre limpio y único para evitar problemas de parsing en Telegram
     clean_name = f"img_{uuid.uuid4().hex}{ext}"
-
     return InputFile(bio, filename=clean_name), base_name
 
 # =========================
@@ -294,8 +288,47 @@ async def is_kicked(uid: int) -> bool:
         return uid in kicked_users or (time.time() < maintenance_until_ts)
 
 # =========================
-# Handlers
+# Handlers (mensajes y textos iguales a tu bot de PC)
 # =========================
+async def info_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Comando solo para el administrador.")
+        return
+    texto = (
+        "<b>🛠️ Comandos del bot</b>\n\n"
+        "<b>👥 Usuarios</b>\n"
+        "• Envía números o rangos (ej. <code>1 3 5-8</code>) para pedir cartones.\n"
+        "• <code>/help</code> — Ayuda.\n"
+        "• <code>/v</code> — Tus vendidos (o global si eres admin).\n"
+        "• <code>/r &lt;números/rangos&gt;</code> — Devolver cartones propios.\n"
+        "• <code>/disp</code> — Ver <u>tus</u> cartones disponibles.\n\n"
+        "<b>👑 Admin</b>\n"
+        "• <code>/rango &lt;ini&gt; &lt;fin&gt;</code>, <code>/lista</code>, <code>/usuarios</code>, <code>/kick &lt;usuario&gt;</code>\n"
+        "• <code>/vendido &lt;usuario&gt; &lt;nums/rangos&gt;</code>, <code>/c</code>\n"
+        "• <code>/lote</code>, <code>/ver_lote</code>, <code>/quitar_lote</code>\n"
+        "• <code>/reset</code>, <code>/id</code>\n"
+    )
+    await update.message.reply_text(texto, parse_mode=ParseMode.HTML)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_admin = (update.effective_user.id == ADMIN_ID)
+    texto = (
+        "<b>ℹ️ Ayuda</b>\n\n"
+        "<b>Para todos</b>\n"
+        "• Envía números o rangos para pedir cartones (ej: <code>1 3 5-8</code>).\n"
+        "• <code>/v</code> — Ver tus vendidos.\n"
+        "• <code>/r &lt;números/rangos&gt;</code> — Devolver cartones propios.\n"
+        "• <code>/disp</code> — Ver <u>tus</u> cartones disponibles.\n"
+    )
+    if is_admin:
+        texto += (
+            "\n<b>Admin</b>\n"
+            "• <code>/rango</code>, <code>/lista</code>, <code>/usuarios</code>, <code>/kick</code>\n"
+            "• <code>/vendido</code>, <code>/c</code>, <code>/lote</code>, <code>/ver_lote</code>, <code>/quitar_lote</code>\n"
+            "• <code>/reset</code>, <code>/id</code>, <code>/info</code>\n"
+        )
+    await update.message.reply_text(texto, parse_mode=ParseMode.HTML)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_ready()
     uid = update.effective_user.id
@@ -308,100 +341,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         return
-    await update.message.reply_text("¡Hola! Envía números o rangos (ej. `1 3 5-8`) para recibir cartones.\nComandos: /help", parse_mode=ParseMode.MARKDOWN)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "🧾 *Comandos disponibles*\n"
-        "• /start — Registro / bienvenida\n"
-        "• /help — Esta ayuda\n"
-        "• /id — Ver tu ID\n"
-        "• /info — Info del bot\n"
-        "• /usuarios — Lista de usuarios\n"
-        "• /lote <usuario> <rangos> — Asignar cartones\n"
-        "• /quitar_lote <usuario> <rangos> — Quitar asignación\n"
-        "• /ver_lote [usuario] — Ver lote\n"
-        "• /disp — Ver *tus* disponibles (asignados no vendidos)\n"
-        "• /v — Ver *tus* vendidos\n"
-        "• /vendido <rangos> — Marcar vendidos (manual)\n"
-        "• /r <rangos> — Registrar devoluciones\n"
-        "• /lista — Resumen general\n"
-        "• /rango [a-b] — Ver/actualizar rango global\n"
-        "• /reload — Recargar CSV desde Drive\n"
-        "• /kick <user_id> — Bloquear (admin)\n"
-        "• /off — Modo mantenimiento 2 min (admin)\n"
-        "_También puedes enviar números/rangos como mensaje (envío de imágenes)_"
+    await update.message.reply_text(
+        "¡Hola! Envía números o rangos (ej. `1 3 5-8`) para recibir cartones.\nComandos: /help",
+        parse_mode=ParseMode.MARKDOWN
     )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Tu ID: `{update.effective_user.id}`", parse_mode=ParseMode.MARKDOWN)
 
 async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Mantenemos este texto corto; /info (admin) tiene la guía larga
     await update.message.reply_text("Bot en Render (webhook) + Google Drive (CSV + imágenes).", parse_mode=ParseMode.HTML)
 
 async def usuarios_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_ready()
+    if not await is_admin(update.effective_user.id):
+        return
     dfu = await get_users_df()
     if dfu.empty:
-        await update.message.reply_text("No hay usuarios registrados.")
+        await update.message.reply_text("📇 No hay usuarios registrados.")
         return
-    lines = [f"• {r['nombre_usuario']} ({r['usuario_id']})" for _, r in dfu.iterrows()]
-    await update.message.reply_text("👥 *Usuarios*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-async def ver_lote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_ready()
-    dfu = await get_users_df()
-    dfL = await get_lotes_df()
-    if dfu.empty:
-        await update.message.reply_text("No hay usuarios.")
-        return
-    target = None
-    if context.args:
-        target = " ".join(context.args).strip()
-    else:
-        me = dfu[dfu["usuario_id"] == str(update.effective_user.id)]
-        if not me.empty:
-            target = me.iloc[0]["nombre_usuario"]
-    if not target:
-        await update.message.reply_text("Uso: /ver_lote [usuario]")
-        return
-    mask = dfL["nombre_usuario"].astype(str).str.casefold() == canon(target)
-    nums = sorted(dfL.loc[mask, "carton"].astype(int).tolist()) if not dfL.empty else []
-    await update.message.reply_text(f"📦 Lote de {target}: " + (", ".join(map(str, nums)) if nums else "vacío"))
-
-async def disp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_ready()
-    dfu = await get_users_df()
-    dfl = await get_lotes_df()
-    dfr = await get_reg_df()
-    uid = update.effective_user.id
-    me = dfu[dfu["usuario_id"] == str(uid)]
-    if me.empty:
-        await update.message.reply_text("No estás registrado. Usa /start.")
-        return
-    nombre = me.iloc[0]["nombre_usuario"]
-    mine = dfl[dfl["nombre_usuario"].astype(str).str.casefold() == canon(nombre)]
-    vendidos = set(dfr["imagen"].tolist())
-    disponibles = sorted([int(x) for x in mine["carton"].tolist() if str(int(x)) not in vendidos])
-    await update.message.reply_text("✅ *Tus disponibles*: " + (", ".join(map(str, disponibles)) if disponibles else "ninguno"), parse_mode=ParseMode.MARKDOWN)
-
-async def v_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_ready()
-    dfr = await get_reg_df()
-    mine = dfr[dfr["usuario_id"] == str(update.effective_user.id)]
-    imgs = [r["imagen"] for _, r in mine.iterrows()]
-    await update.message.reply_text("🧾 *Tus vendidos*: " + (", ".join(imgs) if imgs else "ninguno"), parse_mode=ParseMode.MARKDOWN)
+    dfu = dfu.copy()
+    dfu["usuario_id"] = dfu["usuario_id"].astype(str)
+    lineas = [f"👤 {r['nombre_usuario']} — ID: {r['usuario_id']}" for _, r in dfu.sort_values("nombre_usuario").iterrows()]
+    await update.message.reply_text("🧑‍💻 <b>Usuarios registrados</b>\n" + "\n".join(lineas), parse_mode=ParseMode.HTML)
 
 async def lista_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_ready()
+    if not await is_admin(update.effective_user.id):
+        return
     dfr = await get_reg_df()
-    total = len(dfr.index) if not dfr.empty else 0
-    por_user = {}
-    for _, r in dfr.iterrows():
-        por_user[r["nombre_usuario"]] = por_user.get(r["nombre_usuario"], 0) + 1
-    lines = [f"• {k}: {v}" for k, v in sorted(por_user.items())] if por_user else ["(sin ventas)"]
-    await update.message.reply_text(f"📊 *Registro total:* {total}\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    if dfr.empty:
+        ventas_txt = "📄 No se ha vendido ningún cartón."
+    else:
+        lineas = []
+        # agrupar por nombre_usuario
+        grp = dfr.groupby("nombre_usuario")["imagen"].apply(list).reset_index()
+        for _, row in grp.iterrows():
+            nums = sorted(map(int, row["imagen"]))
+            lineas.append(f"👤 {row['nombre_usuario']} (total {len(nums)}): " + ", ".join(map(str, nums)))
+        ventas_txt = "\n".join(lineas)
+
+    devs = await get_devs_df()
+    if devs.empty:
+        devs_txt = "—"
+    else:
+        dgrp = devs.groupby("nombre_usuario")["imagen"].apply(list).reset_index()
+        dlines = [f"♻️ {row['nombre_usuario']}: " + ", ".join(map(str, sorted(map(int, row['imagen'])))) for _, row in dgrp.iterrows()]
+        devs_txt = "\n".join(dlines)
+
+    mensaje = "🧾 <b>Ventas actuales</b>\n" + ventas_txt + "\n\n" + "♻️ <b>Devoluciones</b>\n" + devs_txt
+    await update.message.reply_text(mensaje, parse_mode=ParseMode.HTML)
 
 async def rango_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -416,31 +404,29 @@ async def rango_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     m = RANGE_RE.match(" ".join(context.args))
     if not m:
-        await update.message.reply_text("Uso: /rango a-b")
+        await update.message.reply_text("Uso correcto: /rango a-b")
         return
     a, b = int(m.group(1)), int(m.group(2))
     await write_rango(a, b)
-    await update.message.reply_text(f"Rango actualizado a: {min(a,b)}-{max(a,b)}")
-
-async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_ready()
-    await update.message.reply_text("CSV recargados desde Drive (on-demand).")
+    await update.message.reply_text(f"✅ Rango definido: desde {min(a,b)} hasta {max(a,b)}.")
 
 async def kick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("Solo admin.")
         return
-    if not context.args or not context.args[0].isdigit():
+    if not context.args:
         await update.message.reply_text("Uso: /kick <user_id>")
         return
-    uid = int(context.args[0])
+    uid_s = context.args[0]
+    if not uid_s.isdigit():
+        await update.message.reply_text("Uso: /kick <user_id>")
+        return
+    uid = int(uid_s)
     async with MEM_LOCK:
         kicked_users.add(uid)
-    await update.message.reply_text(f"Usuario {uid} bloqueado (memoria).")
+    await update.message.reply_text(f"⛔ Usuario {uid} bloqueado hasta reinicio.")
 
 async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("Solo admin.")
         return
     mins = 2
     ts = time.time() + mins*60
@@ -449,49 +435,94 @@ async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         maintenance_until_ts = ts
     await update.message.reply_text(f"⚙️ Entrando en mantenimiento {mins} minutos. Durante ese tiempo el bot no responderá.")
 
+async def ver_lote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_ready()
+    dfu = await get_users_df()
+    dfl = await get_lotes_df()
+    if dfu.empty:
+        await update.message.reply_text("No hay usuarios.")
+        return
+    target = None
+    if context.args:
+        target = " ".join(context.args).strip()
+    else:
+        me = dfu[dfu["usuario_id"] == str(update.effective_user.id)]
+        if not me.empty:
+            target = me.iloc[0]["nombre_usuario"]
+    if not target:
+        await update.message.reply_text("Uso: /ver_lote [usuario]")
+        return
+    mask = dfl["nombre_usuario"].astype(str).str.casefold() == canon(target)
+    nums = sorted(dfl.loc[mask, "carton"].astype(int).tolist()) if not dfl.empty else []
+    display = target
+    if not nums:
+        await update.message.reply_text(f"'{display}' no tiene cartones asignados.")
+        return
+    await update.message.reply_text(f"Cartones asignados a '{display}': " + ", ".join(map(str, nums)))
+
 async def lote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("Solo admin.")
         return
     if len(context.args) < 2:
-        await update.message.reply_text("Uso: /lote <usuario> <numeros/rangos>\nEj: /lote juan 1 3 5-8")
+        await update.message.reply_text("Uso: /lote <nombre_usuario> <números/rangos> (ej: /lote Diego 1-5 10 12)")
         return
-    target = context.args[0]
-    nums = parse_numeros(context.args[1:])
+    raw_name = context.args[0]
+    target_canon = canon(raw_name)
+    nums = set(parse_numeros(context.args[1:]))
     if not nums:
-        await update.message.reply_text("No hay números válidos.")
+        await update.message.reply_text("⚠️ No se detectaron números válidos para asignar.")
         return
     dfl = await get_lotes_df()
-    existentes = set(dfl["carton"].astype(int).tolist()) if not dfl.empty else set()
-    nuevos = [n for n in nums if n not in existentes]
-    add_rows = [{"nombre_usuario": target, "carton": str(n)} for n in nuevos]
+    owner_by_num = {int(r["carton"]): str(r["nombre_usuario"]) for _, r in dfl.iterrows()} if not dfl.empty else {}
+    nuevos, ya_mios, conflictos = [], [], []
+    for n in sorted(nums):
+        owner = owner_by_num.get(n)
+        if owner is None:
+            nuevos.append(n)
+        else:
+            if canon(owner) == target_canon:
+                ya_mios.append(n)
+            else:
+                conflictos.append((n, owner))
     rows = dfl.to_dict("records") if not dfl.empty else []
-    rows.extend(add_rows)
+    rows.extend([{"nombre_usuario": raw_name, "carton": str(n)} for n in nuevos])
     await csv_write_all(LOTES_CSV, LOTES_HEADERS, rows)
-    await update.message.reply_text(f"Asignados a {target}: " + (", ".join(map(str, nuevos)) if nuevos else "(ninguno; ya ocupados)"))
+
+    partes = []
+    if nuevos:
+        partes.append(f"✅ Asignados a '{raw_name}': {', '.join(map(str, nuevos))}")
+    if ya_mios:
+        partes.append(f"ℹ️ Ya estaban asignados a ese usuario: {', '.join(map(str, ya_mios))}")
+    if conflictos:
+        partes.append("⛔ En conflicto (ya asignados a otra persona): " + ", ".join(f"{n}→{o}" for n, o in conflictos))
+        partes.append("Para reasignar, usa /quitar_lote al usuario actual y luego /lote al nuevo.")
+    if not partes:
+        partes.append("ℹ️ No hubo nada que asignar.")
+    await update.message.reply_text("\n".join(partes))
 
 async def quitar_lote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("Solo admin.")
         return
     if len(context.args) < 2:
-        await update.message.reply_text("Uso: /quitar_lote <usuario> <numeros/rangos>")
+        await update.message.reply_text("Uso: /quitar_lote <nombre_usuario> <números/rangos>")
         return
-    target = context.args[0]
+    target_canon = canon(context.args[0])
     nums = set(parse_numeros(context.args[1:]))
     dfl = await get_lotes_df()
     if dfl.empty:
         await update.message.reply_text("No hay lotes.")
         return
-    keep = []
-    removed = []
+    keep, removed = [], []
     for _, r in dfl.iterrows():
-        if canon(r["nombre_usuario"]) == canon(target) and int(r["carton"]) in nums:
+        if canon(r["nombre_usuario"]) == target_canon and int(r["carton"]) in nums:
             removed.append(int(r["carton"]))
         else:
             keep.append({"nombre_usuario": r["nombre_usuario"], "carton": str(int(r["carton"]))})
     await csv_write_all(LOTES_CSV, LOTES_HEADERS, keep)
-    await update.message.reply_text(f"Quitados de {target}: " + (", ".join(map(str, sorted(removed))) if removed else "(ninguno)"))
+    if removed:
+        await update.message.reply_text(f"✅ Quitados {len(removed)} cartones del lote de '{context.args[0]}'.")
+    else:
+        await update.message.reply_text("ℹ️ No se encontró ninguno de esos cartones en el lote.")
 
 async def vendido_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_ready()
@@ -505,13 +536,9 @@ async def vendido_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No estás registrado. /start")
         return
     nombre = me.iloc[0]["nombre_usuario"]
+    ts = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
     for n in nums:
-        row = {
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
-            "usuario_id": str(update.effective_user.id),
-            "nombre_usuario": nombre,
-            "imagen": str(n),
-        }
+        row = {"timestamp": ts, "usuario_id": str(update.effective_user.id), "nombre_usuario": nombre, "imagen": str(n)}
         await csv_append_row(REGISTRO_CSV, REGISTRO_HEADERS, row)
     await update.message.reply_text("Marcado como vendido: " + ", ".join(map(str, nums)))
 
@@ -528,8 +555,7 @@ async def devol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     nombre = me.iloc[0]["nombre_usuario"]
     dfr = await get_reg_df()
-    left = []
-    removed = 0
+    left, removed = [], 0
     for _, r in dfr.iterrows():
         if r["usuario_id"] == str(update.effective_user.id) and r["imagen"] in set(map(str, nums)):
             removed += 1
@@ -537,18 +563,80 @@ async def devol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         left.append({h: r.get(h, "") for h in REGISTRO_HEADERS})
     if removed:
         await csv_write_all(REGISTRO_CSV, REGISTRO_HEADERS, left)
+    ts = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
     for n in nums:
-        row = {
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
-            "usuario_id": str(update.effective_user.id),
-            "nombre_usuario": nombre,
-            "imagen": str(n),
-            "motivo": "devolucion",
-        }
+        row = {"timestamp": ts, "usuario_id": str(update.effective_user.id), "nombre_usuario": nombre, "imagen": str(n), "motivo": "devolucion"}
         await csv_append_row(DEVOL_CSV, DEVOL_HEADERS, row)
     await update.message.reply_text(f"Devoluciones registradas: {', '.join(map(str, nums))} (quitados {removed} de registro)")
 
-# Mensajes de números → envío de imágenes + registro
+async def mostrar_vendidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: global. Usuario: propios."""
+    uid = update.effective_user.id
+    dfr = await get_reg_df()
+    if dfr.empty:
+        await update.message.reply_text("📦 Aún no se ha vendido ningún cartón.")
+        return
+    if await is_admin(uid):
+        vendidos = sorted(set(int(x) for x in dfr["imagen"].tolist()))
+        await update.message.reply_text(f"🧾 Total vendidos (global): {len(vendidos)}\n🔢 Números: {', '.join(map(str, vendidos))}")
+        return
+    propios = sorted(set(int(x) for x in dfr[dfr["usuario_id"] == str(uid)]["imagen"].tolist()))
+    if propios:
+        await update.message.reply_text(f"🧾 Tus vendidos: {len(propios)}\n🔢 Números: {', '.join(map(str, propios))}")
+    else:
+        await update.message.reply_text("ℹ️ Aún no has vendido ningún cartón.")
+
+async def disp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_ready()
+    dfu = await get_users_df()
+    dfl = await get_lotes_df()
+    dfr = await get_reg_df()
+    uid = update.effective_user.id
+    me = dfu[dfu["usuario_id"] == str(uid)]
+    if me.empty:
+        await update.message.reply_text("Debes registrarte primero. Envía tu <b>nombre de usuario</b>.", parse_mode=ParseMode.HTML)
+        return
+    nombre = me.iloc[0]["nombre_usuario"]
+    mine = dfl[dfl["nombre_usuario"].astype(str).str.casefold() == canon(nombre)]
+    vendidos = set(dfr["imagen"].tolist())
+    disponibles = sorted([int(x) for x in mine["carton"].tolist() if str(int(x)) not in vendidos])
+    if not disponibles:
+        await update.message.reply_text("ℹ️ No tienes cartones disponibles para pedir ahora mismo.")
+        return
+    # agrupar como en tu bot
+    disp = []
+    start = prev = None
+    for n in disponibles:
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            disp.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = n
+    if start is not None:
+        disp.append(str(start) if start == prev else f"{start}-{prev}")
+    await update.message.reply_text("🎟️ <b>Tus</b> cartones disponibles:\n" + ", ".join(disp), parse_mode=ParseMode.HTML)
+
+async def v_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await mostrar_vendidos(update, context)
+
+async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_ready()
+    await update.message.reply_text("CSV recargados desde Drive (on-demand).")
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Versión nube: no rotamos archivos locales. Solo “limpieza” lógica si eres admin.
+    if not await is_admin(update.effective_user.id):
+        return
+    # Vaciar CSVs en Drive
+    await csv_write_all(USUARIOS_CSV, USUARIOS_HEADERS, [])
+    await csv_write_all(LOTES_CSV, LOTES_HEADERS, [])
+    await csv_write_all(REGISTRO_CSV, REGISTRO_HEADERS, [])
+    await csv_write_all(DEVOL_CSV, DEVOL_HEADERS, [])
+    await update.message.reply_text("✅ Reseteados usuarios, lotes, registro y devoluciones en Drive.")
+
+# Mensajes de números → envío de imágenes (SIEMPRE 1x1) + registro
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_ready()
     if await is_kicked(update.effective_user.id):
@@ -628,77 +716,58 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📨 Enviando N°: {', '.join(map(str, a_enviar))}\n⏳ Espere...")
 
-    # Media group en bloques de 10
-    batch: List[InputMediaPhoto] = []
-    names: List[str] = []
-
-    async def flush():
-        nonlocal batch, names
-        if not batch:
-            return
-
-        try:
-            if len(batch) == 1:
-                # 1 imagen → send_photo
-                item = batch[0]
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=item.media,
-                    caption=item.caption or None,
-                )
-            else:
-                # 2..n → álbum en bloques de 10
-                for i in range(0, len(batch), 10):
-                    chunk = batch[i:i+10]
-                    await context.bot.send_media_group(
-                        chat_id=update.effective_chat.id,
-                        media=chunk
-                    )
-        except Exception as e:
-            # Fallback: si el álbum falla, enviamos 1x1 para no perder el envío
-            logging.exception("Fallo media_group, reintento individual: %s", e)
-            for item in batch:
-                try:
-                    await context.bot.send_photo(
-                        chat_id=update.effective_chat.id,
-                        photo=item.media,
-                        caption=item.caption or None,
-                    )
-                except Exception as e2:
-                    logging.exception("También falló una foto individual: %s", e2)
-                    # seguimos con las demás
-
-        # Registrar ventas en CSV
-        for fname in names:
-            row = {
-                "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
-                "usuario_id": str(uid),
-                "nombre_usuario": mi_nombre,
-                "imagen": fname,
-            }
-            await csv_append_row(REGISTRO_CSV, REGISTRO_HEADERS, row)
-
-        batch, names = [], []
-
-
-    # Construcción del lote
+    # Envío SIEMPRE 1x1 + registro inmediato
+    enviados_ok = []
     for n in a_enviar:
         res = await get_image_inputfile(str(n))
         if not res:
             await update.message.reply_text(f"❌ No encontré {n} en Drive.")
             continue
         input_file, fname = res
-        batch.append(InputMediaPhoto(media=input_file, caption=fname))
-        names.append(str(n))
-        if len(batch) == 10:
-            await flush()
-    await flush()
+        try:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=input_file,
+                caption=fname
+            )
+            enviados_ok.append(str(n))
+            row = {
+                "timestamp": datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds"),
+                "usuario_id": str(uid),
+                "nombre_usuario": mi_nombre,
+                "imagen": str(n),
+            }
+            await csv_append_row(REGISTRO_CSV, REGISTRO_HEADERS, row)
+        except Exception as e:
+            log.exception("Error enviando foto %s: %s", n, e)
+
+# =========================
+# Comandos extra como en tu bot de PC
+# =========================
+async def comando_c(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /c <números/rangos> — enviar directo (no registra venta). Admin.
+    if not await is_admin(update.effective_user.id):
+        return
+    numeros = set(parse_numeros(context.args))
+    if not numeros:
+        await update.message.reply_text("Uso: /c <número(s)> o rangos (ej: 1 2 5-10)")
+        return
+    await update.message.reply_text(f"📨 Enviando cartones: {', '.join(map(str, sorted(numeros)))}\n⏳ Espere...")
+    for n in sorted(numeros):
+        res = await get_image_inputfile(str(n))
+        if not res:
+            await update.message.reply_text(f"❌ No se encontró el cartón N° {n}.")
+            continue
+        input_file, _ = res
+        try:
+            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=input_file)
+        except Exception:
+            pass
 
 # =========================
 # Webhook startup
 # =========================
 async def on_startup(app: Application):
-    # Solo preparamos CSV y logueamos; NO registramos webhook aquí
     await ensure_ready()
     if not PUBLIC_URL:
         log.warning("PUBLIC_URL/RENDER_EXTERNAL_URL no definido; PTB usará webhook_url de run_webhook.")
@@ -708,11 +777,11 @@ async def on_startup(app: Application):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # comandos
+    # comandos (alineados con tu bot de PC)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
-    app.add_handler(CommandHandler("info", info_cmd))
+    app.add_handler(CommandHandler("info", info_admin))      # /info como guía admin (igual que tu bot)
     app.add_handler(CommandHandler("usuarios", usuarios_cmd))
     app.add_handler(CommandHandler("ver_lote", ver_lote_cmd))
     app.add_handler(CommandHandler("disp", disp_cmd))
@@ -726,6 +795,8 @@ def main():
     app.add_handler(CommandHandler("quitar_lote", quitar_lote_cmd))
     app.add_handler(CommandHandler("vendido", vendido_cmd))
     app.add_handler(CommandHandler("r", devol_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("c", comando_c))
 
     # textos
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
@@ -733,11 +804,9 @@ def main():
     app.post_init = on_startup
 
     webhook_path = f"/webhook/{BOT_TOKEN}"
-
     base_url = (PUBLIC_URL or "").rstrip("/")
     if not base_url.startswith("http"):
         base_url = f"https://{base_url.lstrip('/')}"
-
     webhook_url = f"{base_url}{webhook_path}"
 
     log.info(f"Iniciando servidor en 0.0.0.0:{PORT}{webhook_path}")
@@ -747,9 +816,10 @@ def main():
         listen="0.0.0.0",
         port=PORT,
         url_path=webhook_path,
-        webhook_url=webhook_url,        # PTB hace setWebhook con esta URL
+        webhook_url=webhook_url,
         drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
     main()
+
