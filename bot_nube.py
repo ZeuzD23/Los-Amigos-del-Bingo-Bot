@@ -1,4 +1,6 @@
 import os, io, re, csv, json, asyncio, logging, time, uuid
+import mimetypes
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
@@ -207,13 +209,33 @@ async def get_image_inputfile(query_text: str) -> Optional[Tuple[InputFile, str]
     meta = drive_find_image(service, query_text)
     if not meta:
         return None
+
     data = drive_download_bytes(service, meta["id"])
     bio = io.BytesIO(data)
     bio.seek(0)
+
+    # Intenta conservar la extensión real
     base_name = meta.get("name") or f"{query_text}.jpg"
-    # filename único para evitar errores en media groups
-    unique_name = f"{base_name}__{uuid.uuid4().hex}.bin"
-    return InputFile(bio, filename=unique_name), base_name
+    # Deducir extensión por mime o por nombre original
+    mime = meta.get("mimeType", "")
+    ext = None
+    if mime and mime.startswith("image/"):
+        guess = mimetypes.guess_extension(mime)  # p.ej. ".jpg"
+        if guess:
+            ext = guess
+    if not ext:
+        # Usa la extensión del nombre original si es conocida
+        for e in [".jpg", ".jpeg", ".png", ".webp"]:
+            if base_name.lower().endswith(e):
+                ext = e
+                break
+    if not ext:
+        ext = ".jpg"
+
+    # Nombre de adjunto *limpio* y único (sin espacios/acentos)
+    clean_name = f"img_{uuid.uuid4().hex}{ext}"
+
+    return InputFile(bio, filename=clean_name), base_name
 
 # =========================
 # Utilidades de negocio
@@ -610,29 +632,43 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch: List[InputMediaPhoto] = []
     names: List[str] = []
 
-    async def flush():
+        async def flush():
         nonlocal batch, names
         if not batch:
             return
 
-        if len(batch) == 1:
-            # 1 imagen → send_photo
-            item = batch[0]
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=item.media,
-                caption=item.caption or None,
-            )
-        else:
-            # 2..n → enviar en grupos de 10
-            for i in range(0, len(batch), 10):
-                chunk = batch[i:i+10]
-                await context.bot.send_media_group(
+        try:
+            if len(batch) == 1:
+                # 1 imagen → send_photo
+                item = batch[0]
+                await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
-                    media=chunk
+                    photo=item.media,
+                    caption=item.caption or None,
                 )
+            else:
+                # 2..n → álbum en bloques de 10
+                for i in range(0, len(batch), 10):
+                    chunk = batch[i:i+10]
+                    await context.bot.send_media_group(
+                        chat_id=update.effective_chat.id,
+                        media=chunk
+                    )
+        except Exception as e:
+            # Fallback: si el álbum falla, enviamos 1x1 para no perder el envío
+            logging.exception("Fallo media_group, reintento individual: %s", e)
+            for item in batch:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=update.effective_chat.id,
+                        photo=item.media,
+                        caption=item.caption or None,
+                    )
+                except Exception as e2:
+                    logging.exception("También falló una foto individual: %s", e2)
+                    # seguimos con las demás
 
-        # Registro
+        # Registrar ventas en CSV
         for fname in names:
             row = {
                 "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
@@ -643,6 +679,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await csv_append_row(REGISTRO_CSV, REGISTRO_HEADERS, row)
 
         batch, names = [], []
+
 
     # Construcción del lote
     for n in a_enviar:
