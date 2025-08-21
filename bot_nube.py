@@ -644,16 +644,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Webhook startup
 # =========================
 async def on_startup(app: Application):
+    # Solo preparamos CSV y ponemos logs. No llamamos a set_webhook aquí.
     await ensure_ready()
     if not PUBLIC_URL:
-        log.warning("PUBLIC_URL/RENDER_EXTERNAL_URL no definido; no se registrará webhook.")
-        return
-    webhook_path = f"/webhook/{BOT_TOKEN}"
-    webhook_url = f"{PUBLIC_URL}{webhook_path}"
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.bot.set_webhook(url=webhook_url)
-    log.info(f"Webhook registrado en: {webhook_url}")
+        log.warning("PUBLIC_URL/RENDER_EXTERNAL_URL no definido; PTB usará el webhook_url de run_webhook.")
+    else:
+        log.info(f"PUBLIC_URL detectada: {PUBLIC_URL}")
 
+# --- main() pasando webhook_url a run_webhook ---
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -679,11 +677,29 @@ def main():
     # textos
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
+    # hook de arranque (sin set_webhook)
     app.post_init = on_startup
 
+    # ruta local del webhook (debe incluir el token)
     webhook_path = f"/webhook/{BOT_TOKEN}"
+
+    # construir la URL pública completa que usará PTB para registrar el webhook
+    base_url = (PUBLIC_URL or "").rstrip("/")
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url.lstrip('/')}"
+
+    webhook_url = f"{base_url}{webhook_path}"
+
     log.info(f"Iniciando servidor en 0.0.0.0:{PORT}{webhook_path}")
-    app.run_webhook(listen="0.0.0.0", port=PORT, url_path=webhook_path)
+    log.info(f"Webhook URL usado por PTB: {webhook_url}")
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=webhook_path,
+        webhook_url=webhook_url,        # <- clave: PTB hará setWebhook con esta URL
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
