@@ -1,4 +1,4 @@
-import os, io, re, csv, json, asyncio, logging, time
+import os, io, re, csv, json, asyncio, logging, time, uuid
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
@@ -29,7 +29,8 @@ DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GSA_JSON = os.environ["GSA_JSON"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
+PUBLIC_URL = PUBLIC_URL.rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
 # CSV en tu Drive
@@ -38,13 +39,13 @@ LOTES_CSV = "lotes.csv"
 DEVOL_CSV = "devoluciones.csv"
 REGISTRO_CSV = "registro.csv"
 
-# Cabeceras base (ajústalas si tus CSV ya tienen otras columnas)
+# Cabeceras base
 USUARIOS_HEADERS = ["usuario_id", "nombre_usuario", "nombre_completo"]
 LOTES_HEADERS    = ["nombre_usuario", "carton"]
 DEVOL_HEADERS    = ["timestamp", "usuario_id", "nombre_usuario", "imagen", "motivo"]
 REGISTRO_HEADERS = ["timestamp", "usuario_id", "nombre_usuario", "imagen"]
 
-# Rango global (archivo texto en Drive)
+# Rango global (texto)
 RANGO_TXT = "rango.txt"  # ej. "1-1000"
 
 # Concurrencia
@@ -54,7 +55,7 @@ MEM_LOCK = asyncio.Lock()
 # En memoria
 usuarios_pendientes: set[int] = set()
 kicked_users: set[int] = set()
-maintenance_until_ts: float = 0.0  # /off: modo mantenimiento (epoch); si > now, ignora mensajes
+maintenance_until_ts: float = 0.0  # /off: modo mantenimiento
 
 IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 RANGE_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
@@ -71,7 +72,8 @@ def drive_client(readwrite: bool = True):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def drive_find_file(service, name_exact: str) -> Optional[Dict]:
-    name_sanitized = name_exact.replace("'", "\\'")
+    # sanitizar comillas simples para la query
+    name_sanitized = (name_exact or "").replace("'", "\\'")
     q = f"'{DRIVE_FOLDER_ID}' in parents and name = '{name_sanitized}' and trashed = false"
     r = service.files().list(q=q, fields="files(id,name,mimeType)").execute()
     files = r.get("files", [])
@@ -82,7 +84,7 @@ def drive_search_contains(service, substr: str, mime_contains: Optional[str] = N
     if mime_contains:
         q += f" and mimeType contains '{mime_contains}'"
     page_token = None
-    low = substr.lower()
+    low = (substr or "").lower()
     while True:
         resp = service.files().list(q=q, fields="nextPageToken,files(id,name,mimeType)", pageToken=page_token).execute()
         for f in resp.get("files", []):
@@ -185,7 +187,7 @@ async def write_rango(a: int, b: int):
 # Imágenes desde Drive
 # =========================
 def normalize_query_to_candidates(text: str) -> List[str]:
-    text = text.strip()
+    text = (text or "").strip()
     cands = [text]
     low = text.lower()
     if not any(low.endswith(ext) for ext in IMAGE_EXTS):
@@ -207,8 +209,11 @@ async def get_image_inputfile(query_text: str) -> Optional[Tuple[InputFile, str]
         return None
     data = drive_download_bytes(service, meta["id"])
     bio = io.BytesIO(data)
-    bio.name = meta["name"]
-    return InputFile(bio), meta["name"]
+    bio.seek(0)
+    base_name = meta.get("name") or f"{query_text}.jpg"
+    # filename único para evitar errores en media groups
+    unique_name = f"{base_name}__{uuid.uuid4().hex}.bin"
+    return InputFile(bio, filename=unique_name), base_name
 
 # =========================
 # Utilidades de negocio
@@ -397,7 +402,6 @@ async def rango_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_ready()
-    # Nada especial: las lecturas son siempre frescas desde Drive
     await update.message.reply_text("CSV recargados desde Drive (on-demand).")
 
 async def kick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,7 +440,6 @@ async def lote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No hay números válidos.")
         return
     dfl = await get_lotes_df()
-    # exclusividad: no duplicar
     existentes = set(dfl["carton"].astype(int).tolist()) if not dfl.empty else set()
     nuevos = [n for n in nums if n not in existentes]
     add_rows = [{"nombre_usuario": target, "carton": str(n)} for n in nuevos]
@@ -502,7 +505,6 @@ async def devol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No estás registrado. /start")
         return
     nombre = me.iloc[0]["nombre_usuario"]
-    # Log devolución y (opcional) remover del registro si estaba
     dfr = await get_reg_df()
     left = []
     removed = 0
@@ -528,7 +530,6 @@ async def devol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_ready()
     if await is_kicked(update.effective_user.id):
-        # Silencio en modo mantenimiento o kick
         return
 
     uid = update.effective_user.id
@@ -613,9 +614,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nonlocal batch, names
         if not batch:
             return
-        for i in range(0, len(batch), 10):
-            chunk = batch[i:i+10]
-            await context.bot.send_media_group(chat_id=update.effective_chat.id, media=chunk)
+
+        if len(batch) == 1:
+            # 1 imagen → send_photo
+            item = batch[0]
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=item.media,
+                caption=item.caption or None,
+            )
+        else:
+            # 2..n → enviar en grupos de 10
+            for i in range(0, len(batch), 10):
+                chunk = batch[i:i+10]
+                await context.bot.send_media_group(
+                    chat_id=update.effective_chat.id,
+                    media=chunk
+                )
+
         # Registro
         for fname in names:
             row = {
@@ -625,6 +641,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "imagen": fname,
             }
             await csv_append_row(REGISTRO_CSV, REGISTRO_HEADERS, row)
+
         batch, names = [], []
 
     # Construcción del lote
@@ -644,14 +661,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Webhook startup
 # =========================
 async def on_startup(app: Application):
-    # Solo preparamos CSV y ponemos logs. No llamamos a set_webhook aquí.
+    # Solo preparamos CSV y logueamos; NO registramos webhook aquí
     await ensure_ready()
     if not PUBLIC_URL:
-        log.warning("PUBLIC_URL/RENDER_EXTERNAL_URL no definido; PTB usará el webhook_url de run_webhook.")
+        log.warning("PUBLIC_URL/RENDER_EXTERNAL_URL no definido; PTB usará webhook_url de run_webhook.")
     else:
         log.info(f"PUBLIC_URL detectada: {PUBLIC_URL}")
 
-# --- main() pasando webhook_url a run_webhook ---
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -677,13 +693,10 @@ def main():
     # textos
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # hook de arranque (sin set_webhook)
     app.post_init = on_startup
 
-    # ruta local del webhook (debe incluir el token)
     webhook_path = f"/webhook/{BOT_TOKEN}"
 
-    # construir la URL pública completa que usará PTB para registrar el webhook
     base_url = (PUBLIC_URL or "").rstrip("/")
     if not base_url.startswith("http"):
         base_url = f"https://{base_url.lstrip('/')}"
@@ -697,10 +710,9 @@ def main():
         listen="0.0.0.0",
         port=PORT,
         url_path=webhook_path,
-        webhook_url=webhook_url,        # <- clave: PTB hará setWebhook con esta URL
+        webhook_url=webhook_url,        # PTB hace setWebhook con esta URL
         drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
     main()
-
